@@ -1,0 +1,20 @@
+# Dependências para os Robôs de Sincronização
+# Instalar com: pip install -r requirements_robos.txt
+
+# Firebase
+firebase-admin==6.2.0
+
+# Google APIs
+google-auth==2.25.2
+google-auth-oauthlib==1.2.0
+google-auth-httplib2==0.2.0
+google-api-python-client==1.12.5
+
+# iCalendar
+icalendar==5.0.11
+
+# HTTP requests
+requests==2.31.0
+
+# Utilitários
+python-dateutil==2.8.2
