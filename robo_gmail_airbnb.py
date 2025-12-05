@@ -4,7 +4,7 @@
 Robô de Sincronização de Reservas entre Gmail, Airbnb e Firebase.
 
 Funcionalidades principais:
-- Lê e-mails no Gmail relacionados a reservas do Airbnb
+- Lê e-mails no Gmail relacionados a reservas do Airbnb (encaminhados por tiagoddantas@me.com)
 - Processa os dados da reserva
 - Atualiza o Firestore com as reservas sincronizadas
 
@@ -63,7 +63,7 @@ class AirbnbGmailSyncBot:
         self.email_user = os.getenv('GMAIL_USER_EMAIL', '')
         self.search_query = os.getenv(
             'GMAIL_SEARCH_QUERY',
-            'from:(tiagoddantas@me.com) subject:(Enc: Reserva confirmada)'
+            'from:(tiagoddantas@me.com) subject:("Enc: Reserva confirmada -")'
         )
         
         # Tempo entre execuções em modo contínuo (em segundos)
@@ -231,6 +231,45 @@ class AirbnbGmailSyncBot:
         return sem_tags.strip()
 
     # ---------------------------------------------------------
+    # Helpers específicos para hospede e nomeApAirbnb
+    # ---------------------------------------------------------
+    def _extrair_hospede_do_assunto(self, assunto: str) -> Optional[str]:
+        """
+        Extrai o nome do hóspede a partir do assunto, entre:
+        'Enc: Reserva confirmada - ' e ' chega'
+        Exemplo:
+        Enc: Reserva confirmada - Letícia chega em 18 de fev. de 2026
+        => hospede = 'Letícia'
+        """
+        if not assunto:
+            return None
+        m = re.search(
+            r'Enc:\s*Reserva\s+confirmada\s*-\s*(.*?)\s+chega',
+            assunto,
+            flags=re.IGNORECASE
+        )
+        if m:
+            return m.group(1).strip()
+        return None
+
+    def _extrair_nomeap_envie_mensagem(self, email_body: str, hospede: str) -> Optional[str]:
+        """
+        Extrai o nome do apartamento a partir da frase:
+        'Envie uma Mensagem para {HOSPEDE} {NOME_AP}'
+        Exemplo:
+        Envie uma Mensagem para Letícia Eco Resort Praia dos Carneiros - Flat Colina
+        => nomeApAirbnb = 'Eco Resort Praia dos Carneiros - Flat Colina'
+        """
+        if not email_body or not hospede:
+            return None
+        texto_limpo = self._limpar_html(email_body)
+        pattern = rf'Envie uma Mensagem para\s+{re.escape(hospede)}\s+([^\n]+)'
+        m = re.search(pattern, texto_limpo, flags=re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+        return None
+
+    # ---------------------------------------------------------
     # Parsing de datas PT-BR (incluindo abreviações Airbnb)
     # ---------------------------------------------------------
     def _parse_data_pt_br(self, data_str: str) -> str:
@@ -295,17 +334,13 @@ class AirbnbGmailSyncBot:
         return data_str
 
     # ---------------------------------------------------------
-    # Parsing de e-mail Airbnb (HTML + fallback em texto)
+    # Parsing de e-mail Airbnb (HTML + texto)
     # ---------------------------------------------------------
     def parse_reserva_airbnb(self, email_body: str) -> Dict:
         """
-        Interpreta o corpo de e-mail do Airbnb para extrair dados da reserva,
-        usando:
-        - HTML quando possível
-        - Regras específicas de texto que você definiu:
-          • valor_total: logo após "você recebe"
-          • hospede: nome logo após "Nova reserva confirmada!"
-          • nomeApAirbnb: texto antes de "Casa/apto inteiro"
+        Interpreta o corpo de e-mail do Airbnb para extrair dados da reserva.
+        (hóspede e nomeApAirbnb serão refinados no processar_emails com base no assunto
+        e na frase 'Envie uma Mensagem para {hospede} ...')
         """
         reserva = {
             "origem": "airbnb",
@@ -325,31 +360,8 @@ class AirbnbGmailSyncBot:
             texto_limpo = self._limpar_html(html)
 
             # ===================================================
-            # 1) nomeApAirbnb
+            # Datas de check-in e check-out (mantendo lógica anterior)
             # ===================================================
-            # Regra que você pediu: texto ANTES de "Casa/apto inteiro"
-            m_nome_casa = re.search(
-                r'([^\n]+?)\s+Casa/apto inteiro',
-                texto_limpo,
-                flags=re.IGNORECASE
-            )
-            if m_nome_casa:
-                reserva["nomeApAirbnb"] = m_nome_casa.group(1).strip()
-
-            # Fallback: primeiro <h2> (se houver)
-            if not reserva["nomeApAirbnb"]:
-                match_nome_h2 = re.search(
-                    r'<h2[^>]*>(.*?)</h2>',
-                    html,
-                    flags=re.IGNORECASE | re.DOTALL
-                )
-                if match_nome_h2:
-                    reserva["nomeApAirbnb"] = self._limpar_html(match_nome_h2.group(1))
-
-            # ===================================================
-            # 2) Datas de check-in e check-out
-            # ===================================================
-            # HTML: <p style="font-size:22px;line-height:26px;...">data</p>
             padrao_datas_html = (
                 r'<p[^>]*font-size:22px;line-height:26px;[^>]*>'
                 r'(.*?)</p>'
@@ -360,15 +372,12 @@ class AirbnbGmailSyncBot:
                 flags=re.IGNORECASE | re.DOTALL
             )
             if datas_html:
-                # Primeiro p = check-in
                 checkin_str = self._limpar_html(datas_html[0])
                 reserva["checkin"] = self._parse_data_pt_br(checkin_str)
-                # Segundo p (se existir) = check-out
                 if len(datas_html) > 1:
                     checkout_str = self._limpar_html(datas_html[1])
                     reserva["checkout"] = self._parse_data_pt_br(checkout_str)
 
-            # Fallback em texto: pega as duas primeiras datas no padrão "qua., 18 de fev. de 2026"
             if not reserva["checkin"] or not reserva["checkout"]:
                 datas_txt = re.findall(
                     r'(?:seg|ter|qua|qui|sex|sáb|sab|dom)\.?,?\s*\d{1,2}\s+de\s+[a-zç\.]+\s+de\s+\d{4}',
@@ -381,9 +390,8 @@ class AirbnbGmailSyncBot:
                     reserva["checkout"] = self._parse_data_pt_br(datas_txt[1])
 
             # ===================================================
-            # 3) Código da reserva
+            # Código da reserva
             # ===================================================
-            # Mesmo padrão anterior (HTML + fallback texto)
             match_codigo_tag = re.search(
                 r'<p[^>]*font-size:18px;line-height:28px;font-family[Cereal\s\:;#0-9a-zA-Z\-,"\.]*'
                 r'font-weight:400[^>]*margin:0!important[^>]*>(.*?)</p>',
@@ -396,48 +404,14 @@ class AirbnbGmailSyncBot:
                 if m_cod:
                     reserva["codigo_reserva"] = m_cod.group(0).strip()
 
-            # Fallback geral: primeiro token alfanumérico grande (tipo HMB39THXQK)
             if not reserva["codigo_reserva"]:
                 possiveis_codigos = re.findall(r'\b[A-Z0-9]{8,14}\b', texto_limpo)
                 if possiveis_codigos:
                     reserva["codigo_reserva"] = possiveis_codigos[0]
 
             # ===================================================
-            # 4) hospede
+            # quantidade_hospedes (adultos + crianças + bebês)
             # ===================================================
-            # Regra que você pediu: nome logo após "Nova reserva confirmada!"
-            m_hosp_reserva = re.search(
-                r'Nova reserva confirmada!\s*([^\n,]+)',
-                texto_limpo,
-                flags=re.IGNORECASE
-            )
-            if m_hosp_reserva:
-                reserva["hospede"] = m_hosp_reserva.group(1).strip()
-
-            # Fallback HTML: <p ...font-weight:700!important">Letícia</p>
-            if not reserva["hospede"]:
-                match_hospede = re.search(
-                    r'<p[^>]*font-weight:700!important[^>]*>(.*?)</p>',
-                    html,
-                    flags=re.IGNORECASE | re.DOTALL
-                )
-                if match_hospede:
-                    reserva["hospede"] = self._limpar_html(match_hospede.group(1))
-
-            # Fallback texto: padrão "Hóspede: Nome"
-            if not reserva["hospede"]:
-                m_hosp_txt = re.search(
-                    r'Hóspede(?: principal)?:\s*([A-ZÀ-Ý][^\n,]*)',
-                    texto_limpo,
-                    flags=re.IGNORECASE
-                )
-                if m_hosp_txt:
-                    reserva["hospede"] = m_hosp_txt.group(1).strip()
-
-            # ===================================================
-            # 5) quantidade_hospedes (adultos + crianças + bebês)
-            # ===================================================
-            # HTML: p com font-weight:400!important contendo "2 adultos", "1 criança" etc.
             blocos_hosp = re.findall(
                 r'<p[^>]*font-weight:400!important[^>]*>(.*?)</p>',
                 html,
@@ -455,7 +429,6 @@ class AirbnbGmailSyncBot:
                     if reserva["quantidade_hospedes"] > 0:
                         break
 
-            # Fallback texto: procurar no texto limpo
             if reserva["quantidade_hospedes"] == 0:
                 for m in re.finditer(
                     r'(\d+)\s+(adulto|adultos|criança|crianças|bebê|bebês)',
@@ -465,50 +438,19 @@ class AirbnbGmailSyncBot:
                     reserva["quantidade_hospedes"] += int(m.group(1))
 
             # ===================================================
-            # 6) valor_total
+            # valor_total (primeiro R$ encontrado como fallback geral)
+            # (regra "você recebe" será aplicada depois em texto_limpo, se existir)
             # ===================================================
-            # Regra que você pediu: valor logo após "você recebe"
-            m_val_voce = re.search(
-                r'voc[êe]\s+recebe[^R$]*R\$\s*([\d\.\,]+)',
-                texto_limpo,
-                flags=re.IGNORECASE
-            )
-            if m_val_voce:
-                v = m_val_voce.group(1).strip()
+            m_val_txt = re.search(r'R\$\s*([\d\.\,]+)', texto_limpo)
+            if m_val_txt:
+                v = m_val_txt.group(1).strip()
                 v = v.replace('.', '').replace(',', '.')
                 try:
                     reserva["valor_total"] = float(v)
                 except Exception as e:
-                    logger.error(f"Erro ao converter valor_total (você recebe) '{v}': {e}")
+                    logger.error(f"Erro ao converter valor_total fallback '{v}': {e}")
 
-            # Fallback HTML: <h3 ...text-align:right!important">R$1.717,53</h3>
-            if reserva["valor_total"] == 0:
-                match_valor_tag = re.search(
-                    r'<h3[^>]*text-align:right!important[^>]*>(.*?)</h3>',
-                    html,
-                    flags=re.IGNORECASE | re.DOTALL
-                )
-                if match_valor_tag:
-                    valor_txt = self._limpar_html(match_valor_tag.group(1))
-                    valor_sem_simbolo = valor_txt.replace('R$', '').strip()
-                    valor_sem_simbolo = valor_sem_simbolo.replace('.', '').replace(',', '.')
-                    try:
-                        reserva["valor_total"] = float(valor_sem_simbolo)
-                    except Exception as e:
-                        logger.error(f"Erro ao converter valor_total '{valor_txt}': {e}")
-
-            # Fallback extra: primeira ocorrência de "R$"
-            if reserva["valor_total"] == 0:
-                m_val_txt = re.search(r'R\$\s*([\d\.\,]+)', texto_limpo)
-                if m_val_txt:
-                    v = m_val_txt.group(1).strip()
-                    v = v.replace('.', '').replace(',', '.')
-                    try:
-                        reserva["valor_total"] = float(v)
-                    except Exception as e:
-                        logger.error(f"Erro ao converter valor_total fallback '{v}': {e}")
-
-            logger.info(f"📦 Reserva Airbnb parseada: {reserva}")
+            logger.info(f"📦 Reserva Airbnb parseada (parcial): {reserva}")
 
         except Exception as e:
             logger.error(f"Erro ao parsear e-mail de reserva Airbnb: {e}")
@@ -519,7 +461,7 @@ class AirbnbGmailSyncBot:
     # Integração com Gmail
     # ---------------------------------------------------------
     def buscar_emails_reservas(self, max_results: int = 10) -> List[Dict]:
-        """Busca e-mails de confirmação de reserva do Airbnb no Gmail."""
+        """Busca e-mails de confirmação de reserva do Airbnb."""
         try:
             logger.info(f"🔎 Buscando e-mails no Gmail com query: {self.search_query}")
             results = self.gmail_service.users().messages().list(
@@ -556,7 +498,35 @@ class AirbnbGmailSyncBot:
                 
                 logger.info(f"✉️ Processando e-mail ID={msg_id}, Assunto='{assunto}'")
                 
+                # Parsing principal (datas, código, quantidade, valor básico)
                 reserva = self.parse_reserva_airbnb(corpo)
+
+                # 🔹 1) Hóspede a partir do ASSUNTO:
+                hospede_assunto = self._extrair_hospede_do_assunto(assunto)
+                if hospede_assunto:
+                    reserva["hospede"] = hospede_assunto
+
+                # 🔹 2) nomeApAirbnb a partir da frase "Envie uma Mensagem para {hospede} ..."
+                if reserva.get("hospede"):
+                    nome_apt = self._extrair_nomeap_envie_mensagem(corpo, reserva["hospede"])
+                    if nome_apt:
+                        reserva["nomeApAirbnb"] = nome_apt
+
+                # 🔹 3) valor_total a partir de "você recebe R$..."
+                texto_limpo = self._limpar_html(corpo or "")
+                m_val_voce = re.search(
+                    r'voc[êe]\s+recebe[^R$]*R\$\s*([\d\.\,]+)',
+                    texto_limpo,
+                    flags=re.IGNORECASE
+                )
+                if m_val_voce:
+                    v = m_val_voce.group(1).strip()
+                    v = v.replace('.', '').replace(',', '.')
+                    try:
+                        reserva["valor_total"] = float(v)
+                    except Exception as e:
+                        logger.error(f"Erro ao converter valor_total (você recebe) '{v}': {e}")
+
                 reserva["assunto_email"] = assunto
                 reserva["data_envio_email"] = data_envio
                 reserva["id_email"] = msg_id
