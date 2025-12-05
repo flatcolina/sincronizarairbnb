@@ -1,100 +1,80 @@
 #!/usr/bin/env python3
 """
-Robô de Sincronização de Reservas - Airbnb via Gmail
-======================================================
+Robô de Sincronização de Reservas entre Gmail, Airbnb e Firebase.
 
-Este script sincroniza automaticamente as reservas do Airbnb
-através da análise de e-mails de confirmação de reserva.
+Funcionalidades principais:
+- Lê e-mails no Gmail relacionados a reservas do Airbnb
+- Processa os dados da reserva
+- Atualiza o Firestore com as reservas sincronizadas
 
-Configuração:
-- Executar em um servidor (ex: Railway) com agendamento (ex: a cada 15 minutos)
-- Variáveis de ambiente necessárias:
-  - FIREBASE_CREDENTIALS_JSON: JSON com credenciais do Firebase
-  - FIREBASE_PROJECT_ID: ID do projeto Firebase
-  - GOOGLE_CLIENT_ID: Client ID do Google OAuth
-  - GOOGLE_CLIENT_SECRET: Client Secret do Google OAuth
-  - GOOGLE_REFRESH_TOKEN: Refresh Token do Google OAuth
-
-Uso:
-  python3 robo_gmail_airbnb.py
-
-Configuração do Google OAuth:
-1. Acesse https://console.cloud.google.com
-2. Crie um novo projeto
-3. Ative a Gmail API
-4. Crie uma credencial OAuth 2.0 (Desktop application)
-5. Use o refresh token obtido
+Modo de execução:
+- Execução única: roda uma vez e finaliza
+- Modo contínuo: verifica a cada X minutos (configurável)
 """
 
 import os
 import sys
+import time
 import json
 import logging
 import base64
 import re
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime
-from html.parser import HTMLParser
+from typing import List, Dict, Optional
+from datetime import datetime, timedelta
 
-# Configurar logging
+# Firebase Admin
+import firebase_admin
+from firebase_admin import credentials, firestore
+
+# Gmail API
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+
+try:
+    from googleapiclient.errors import HttpError
+except ImportError:
+    HttpError = Exception
+
+# Configuração básica de logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    stream=sys.stdout
 )
 logger = logging.getLogger(__name__)
 
-# Importar Firebase
-try:
-    import firebase_admin
-    from firebase_admin import credentials, firestore
-except ImportError:
-    logger.error("Firebase Admin SDK não instalado. Instale com: pip install firebase-admin")
-    sys.exit(1)
 
-# Importar Google
-try:
-    from google.auth.transport.requests import Request
-    from google.oauth2.service_account import Credentials
-    from google.oauth2 import service_account
-    import google.auth
-except ImportError:
-    logger.error("Google Auth não instalado. Instale com: pip install google-auth google-auth-oauthlib google-auth-httplib2")
-    sys.exit(1)
-
-try:
-    from googleapiclient.discovery import build
-    from googleapiclient.errors import HttpError
-except ImportError:
-    logger.error("Google API Client não instalado. Instale com: pip install google-api-python-client")
-    sys.exit(1)
-
-
-class HTMLStripper(HTMLParser):
-    """Remove tags HTML de um texto"""
-    def __init__(self):
-        super().__init__()
-        self.reset()
-        self.strict = False
-        self.convert_charrefs = True
-        self.text = []
-
-    def handle_data(self, d):
-        self.text.append(d)
-
-    def get_data(self):
-        return ''.join(self.text)
-
-
-class RoboGmailAirbnb:
-    """Robô para sincronizar reservas do Airbnb via Gmail"""
+class AirbnbGmailSyncBot:
+    """
+    Robô responsável por:
+    - Conectar ao Gmail
+    - Buscar e-mails de reservas do Airbnb
+    - Extrair dados relevantes
+    - Atualizar Firestore
+    """
 
     def __init__(self):
-        """Inicializa o robô"""
         self.db = None
         self.gmail_service = None
+        
+        # Configurações
+        self.email_user = os.getenv('GMAIL_USER_EMAIL', '')
+        self.search_query = os.getenv(
+            'GMAIL_SEARCH_QUERY',
+            'from:(express@airbnb.com) subject:(Confirmação de reserva)'
+        )
+        
+        # Tempo entre execuções em modo contínuo (em segundos)
+        self.intervalo_segundos = int(os.getenv('SYNC_INTERVAL_SECONDS', '300'))
+        
+        logger.info("🔧 Iniciando configuração do bot de sincronização Airbnb-Gmail-Firebase")
         self.inicializar_firebase()
         self.inicializar_gmail()
 
+    # ---------------------------------------------------------
+    # Inicialização de serviços
+    # ---------------------------------------------------------
     def inicializar_firebase(self):
         """Inicializa a conexão com Firebase"""
         try:
@@ -110,7 +90,10 @@ class RoboGmailAirbnb:
                     sys.exit(1)
                 creds = credentials.Certificate(creds_path)
 
-            if not firebase_admin.get_app():
+            # Garante que o app padrão esteja inicializado
+            try:
+                firebase_admin.get_app()
+            except ValueError:
                 firebase_admin.initialize_app(creds)
             
             self.db = firestore.client()
@@ -128,327 +111,280 @@ class RoboGmailAirbnb:
             refresh_token = os.getenv('GOOGLE_REFRESH_TOKEN')
 
             if not all([client_id, client_secret, refresh_token]):
-                logger.warning("⚠️  Credenciais do Google não configuradas")
-                logger.warning("   Defina: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN")
-                self.gmail_service = None
-                return
-
-            # Criar credencial OAuth
-            from google.oauth2.credentials import Credentials
+                logger.error("⚠️ Variáveis de ambiente do Gmail incompletas.")
+                raise ValueError("Credenciais do Gmail não configuradas corretamente.")
             
-            creds = Credentials(
-                token=None,
-                refresh_token=refresh_token,
-                token_uri='https://oauth2.googleapis.com/token',
-                client_id=client_id,
-                client_secret=client_secret
-            )
-
-            # Construir serviço Gmail
+            token_uri = "https://oauth2.googleapis.com/token"
+            
+            creds_data = {
+                "token": "",
+                "refresh_token": refresh_token,
+                "token_uri": token_uri,
+                "client_id": client_id,
+                "client_secret": client_secret,
+                "scopes": [
+                    "https://www.googleapis.com/auth/gmail.readonly"
+                ]
+            }
+            
+            creds = Credentials.from_authorized_user_info(creds_data)
+            
+            if not creds.valid and creds.expired and creds.refresh_token:
+                logger.info("🔄 Atualizando token de acesso do Gmail...")
+                creds.refresh(Request())
+            
             self.gmail_service = build('gmail', 'v1', credentials=creds)
-            logger.info("✅ Gmail API inicializado com sucesso")
+            logger.info("✅ Gmail API inicializada com sucesso")
+        
         except Exception as e:
-            logger.error(f"❌ Erro ao inicializar Gmail: {e}")
-            self.gmail_service = None
+            logger.error(f"❌ Erro ao inicializar Gmail API: {e}")
+            sys.exit(1)
 
-    def buscar_emails_airbnb(self) -> List[Dict]:
-        """Busca e-mails de confirmação do Airbnb"""
-        if not self.gmail_service:
-            logger.warning("⚠️  Gmail não configurado, pulando sincronização de e-mails")
-            return []
-
+    # ---------------------------------------------------------
+    # Funções utilitárias
+    # ---------------------------------------------------------
+    def extrair_corpo_email(self, message_payload: Dict) -> str:
+        """Extrai o corpo em texto do e-mail (em HTML ou texto simples)"""
         try:
-            logger.info("📧 Buscando e-mails do Airbnb...")
+            if 'parts' in message_payload:
+                parts = message_payload['parts']
+                for part in parts:
+                    body = part.get('body', {})
+                    data = body.get('data')
+                    if data:
+                        decoded_bytes = base64.urlsafe_b64decode(data)
+                        decoded_text = decoded_bytes.decode('utf-8', errors='ignore')
+                        return decoded_text
+            else:
+                body = message_payload.get('body', {})
+                data = body.get('data')
+                if data:
+                    decoded_bytes = base64.urlsafe_b64decode(data)
+                    decoded_text = decoded_bytes.decode('utf-8', errors='ignore')
+                    return decoded_text
+            return ""
+        except Exception as e:
+            logger.error(f"Erro ao extrair corpo de e-mail: {e}")
+            return ""
+
+    def extrair_header(self, headers: List[Dict], name: str) -> Optional[str]:
+        """Extrai um header específico por nome"""
+        for h in headers:
+            if h.get('name', '').lower() == name.lower():
+                return h.get('value', '')
+        return None
+
+    # ---------------------------------------------------------
+    # Parsing de e-mail Airbnb
+    # ---------------------------------------------------------
+    def parse_reserva_airbnb(self, email_body: str) -> Dict:
+        """
+        Interpreta o corpo de e-mail do Airbnb para extrair dados da reserva.
+        Esta função é simplificada e pode ser ajustada conforme o padrão do e-mail.
+        """
+        reserva = {
+            "origem": "airbnb",
+            "status": "pendente",
+            "hospede": "",
+            "checkin": "",
+            "checkout": "",
+            "quantidade_hospedes": 0,
+            "valor_total": 0.0,
+            "moeda": "BRL",
+            "codigo_reserva": "",
+        }
+        
+        try:
+            # Exemplos de regex que você pode ir refinando conforme seus e-mails reais:
             
-            # Buscar e-mails do Airbnb com label 'airbnb-reservas'
+            # Nome do hóspede (exemplo de padrão)
+            match_hospede = re.search(r"Hóspede:\s*(.*)", email_body)
+            if match_hospede:
+                reserva["hospede"] = match_hospede.group(1).strip()
+            
+            # Check-in
+            match_checkin = re.search(r"Check[- ]in:\s*([\d]{1,2}\s+\w+\s+[\d]{4})", email_body)
+            if match_checkin:
+                reserva["checkin"] = self._parse_data_pt_br(match_checkin.group(1))
+            
+            # Check-out
+            match_checkout = re.search(r"Check[- ]out:\s*([\d]{1,2}\s+\w+\s+[\d]{4})", email_body)
+            if match_checkout:
+                reserva["checkout"] = self._parse_data_pt_br(match_checkout.group(1))
+            
+            # Quantidade de hóspedes
+            match_hospedes = re.search(r"(\d+)\s+hóspede", email_body, re.IGNORECASE)
+            if match_hospedes:
+                reserva["quantidade_hospedes"] = int(match_hospedes.group(1))
+            
+            # Valor total (exemplo: R$ 1.234,56)
+            match_valor = re.search(r"R\$\s*([\d\.\,]+)", email_body)
+            if match_valor:
+                valor_str = match_valor.group(1).replace('.', '').replace(',', '.')
+                reserva["valor_total"] = float(valor_str)
+            
+            # Código de reserva (por exemplo, código alfanumérico do Airbnb)
+            match_codigo = re.search(r"Código da reserva:\s*([A-Z0-9]+)", email_body)
+            if match_codigo:
+                reserva["codigo_reserva"] = match_codigo.group(1).strip()
+            
+            logger.info(f"📦 Reserva Airbnb parseada: {reserva}")
+        
+        except Exception as e:
+            logger.error(f"Erro ao parsear e-mail de reserva Airbnb: {e}")
+        
+        return reserva
+
+    def _parse_data_pt_br(self, data_str: str) -> str:
+        """
+        Converte uma data em português (tipo '10 de dezembro de 2025')
+        ou ('10 dezembro 2025') para formato ISO (YYYY-MM-DD).
+        """
+        # Este mapeamento pode ser expandido conforme necessário
+        meses = {
+            "janeiro": 1,
+            "fevereiro": 2,
+            "março": 3,
+            "marco": 3,
+            "abril": 4,
+            "maio": 5,
+            "junho": 6,
+            "julho": 7,
+            "agosto": 8,
+            "setembro": 9,
+            "outubro": 10,
+            "novembro": 11,
+            "dezembro": 12
+        }
+        
+        try:
+            # Tenta padronizar removendo "de"
+            data_str_limpa = data_str.lower().replace(" de ", " ").strip()
+            partes = data_str_limpa.split()
+            if len(partes) == 3:
+                dia = int(partes[0])
+                mes_nome = partes[1]
+                ano = int(partes[2])
+                mes = meses.get(mes_nome, 1)
+                dt = datetime(ano, mes, dia)
+                return dt.strftime("%Y-%m-%d")
+        except Exception as e:
+            logger.error(f"Erro ao converter data '{data_str}': {e}")
+        
+        # Em caso de falha, retorna a string original
+        return data_str
+
+    # ---------------------------------------------------------
+    # Integração com Gmail
+    # ---------------------------------------------------------
+    def buscar_emails_reservas(self, max_results: int = 10) -> List[Dict]:
+        """Busca e-mails de confirmação de reserva do Airbnb no Gmail."""
+        try:
+            logger.info(f"🔎 Buscando e-mails no Gmail com query: {self.search_query}")
             results = self.gmail_service.users().messages().list(
                 userId='me',
-                q='from:reservations@airbnb.com label:airbnb-reservas is:unread',
-                maxResults=10
+                q=self.search_query,
+                maxResults=max_results
             ).execute()
-
+            
             messages = results.get('messages', [])
-            logger.info(f"✅ {len(messages)} e-mails encontrados")
+            logger.info(f"📨 {len(messages)} e-mails encontrados")
             return messages
         except HttpError as error:
-            logger.error(f"❌ Erro ao buscar e-mails: {error}")
+            logger.error(f"Erro ao buscar e-mails: {error}")
             return []
 
-    def obter_conteudo_email(self, message_id: str) -> Optional[str]:
-        """Obtém o conteúdo de um e-mail"""
-        try:
-            message = self.gmail_service.users().messages().get(
-                userId='me',
-                id=message_id,
-                format='full'
-            ).execute()
-
-            # Tentar obter conteúdo
-            if 'parts' in message['payload']:
-                for part in message['payload']['parts']:
-                    if part['mimeType'] == 'text/html':
-                        data = part['body'].get('data', '')
-                        if data:
-                            return base64.urlsafe_b64decode(data).decode('utf-8')
-                    elif part['mimeType'] == 'text/plain':
-                        data = part['body'].get('data', '')
-                        if data:
-                            return base64.urlsafe_b64decode(data).decode('utf-8')
-            else:
-                data = message['payload']['body'].get('data', '')
-                if data:
-                    return base64.urlsafe_b64decode(data).decode('utf-8')
-
-            return None
-        except Exception as e:
-            logger.error(f"❌ Erro ao obter conteúdo do e-mail: {e}")
-            return None
-
-    def remover_html(self, html: str) -> str:
-        """Remove tags HTML de um texto"""
-        stripper = HTMLStripper()
-        stripper.feed(html)
-        return stripper.get_data()
-
-    def extrair_dados_email_airbnb(self, conteudo: str) -> Optional[Dict]:
-        """Extrai dados de reserva do e-mail do Airbnb"""
-        try:
-            # Remover HTML
-            texto = self.remover_html(conteudo)
-            
-            # Padrões de busca
-            padrao_nome = r'(?:Hóspede|Guest|Name):\s*([^\n]+)'
-            padrao_checkin = r'(?:Check-in|Check in)[\s\n]*([^\n]+)'
-            padrao_checkout = r'(?:Check-out|Check out)[\s\n]*([^\n]+)'
-            padrao_codigo = r'(?:Código|Code|Confirmation)[\s\n]*([A-Z0-9]+)'
-            padrao_anuncio = r'(?:Acomodação|Accommodation|Listing)[\s\n]*([^\n]+)'
-            padrao_valor = r'R\$\s*([\d.,]+)'
-            padrao_hospedes = r'(\d+)\s*(?:adultos|adults)'
-
-            # Extrair informações
-            nome_match = re.search(padrao_nome, texto, re.IGNORECASE)
-            checkin_match = re.search(padrao_checkin, texto, re.IGNORECASE)
-            checkout_match = re.search(padrao_checkout, texto, re.IGNORECASE)
-            codigo_match = re.search(padrao_codigo, texto, re.IGNORECASE)
-            anuncio_match = re.search(padrao_anuncio, texto, re.IGNORECASE)
-            valor_match = re.search(padrao_valor, texto, re.IGNORECASE)
-            hospedes_match = re.search(padrao_hospedes, texto, re.IGNORECASE)
-
-            if not all([nome_match, checkin_match, checkout_match, codigo_match]):
-                logger.warning("⚠️  Não foi possível extrair todos os dados do e-mail")
-                return None
-
-            nome = nome_match.group(1).strip()
-            codigo = codigo_match.group(1).strip()
-            anuncio = anuncio_match.group(1).strip() if anuncio_match else ''
-            valor = valor_match.group(1).strip() if valor_match else '0'
-            hospedes = int(hospedes_match.group(1)) if hospedes_match else 1
-
-            # Processar datas
-            data_checkin = self.extrair_data(checkin_match.group(1))
-            data_checkout = self.extrair_data(checkout_match.group(1))
-
-            if not data_checkin or not data_checkout:
-                logger.warning("⚠️  Não foi possível extrair datas válidas")
-                return None
-
-            return {
-                'nome': nome,
-                'dataCheckin': data_checkin,
-                'dataCheckout': data_checkout,
-                'codigoReserva': codigo,
-                'anuncio': anuncio,
-                'valor': valor,
-                'numeroHospedes': hospedes
-            }
-        except Exception as e:
-            logger.error(f"❌ Erro ao extrair dados do e-mail: {e}")
-            return None
-
-    def extrair_data(self, texto_data: str) -> Optional[str]:
-        """Extrai data no formato YYYY-MM-DD de um texto"""
-        try:
-            # Remover espaços extras
-            texto_data = texto_data.strip()
-            
-            # Tentar vários formatos
-            formatos = [
-                '%d/%m/%Y',
-                '%d-%m-%Y',
-                '%Y-%m-%d',
-                '%d de %B de %Y',
-                '%d de %b de %Y',
-                '%d %B %Y',
-                '%d %b %Y',
-            ]
-
-            for fmt in formatos:
-                try:
-                    data = datetime.strptime(texto_data, fmt)
-                    return data.strftime('%Y-%m-%d')
-                except ValueError:
-                    continue
-
-            # Se nenhum formato funcionou, tentar extrair números
-            numeros = re.findall(r'\d+', texto_data)
-            if len(numeros) >= 3:
-                dia, mes, ano = numeros[0], numeros[1], numeros[2]
-                if len(ano) == 2:
-                    ano = '20' + ano
-                return f"{ano}-{mes.zfill(2)}-{dia.zfill(2)}"
-
-            return None
-        except Exception as e:
-            logger.warning(f"⚠️  Erro ao extrair data: {e}")
-            return None
-
-    def obter_apartamento_por_anuncio(self, nome_anuncio: str) -> Optional[str]:
-        """Obtém o ID do apartamento a partir do nome do anúncio"""
-        try:
-            config = self.db.collection('integracao_config').stream()
-            
-            for doc in config:
-                config_data = doc.to_dict()
-                mappings = config_data.get('airbnbMappings', [])
-                
-                for mapping in mappings:
-                    if mapping.get('nomeAnuncio', '').lower() == nome_anuncio.lower():
-                        return mapping.get('apartamentoId')
-            
-            return None
-        except Exception as e:
-            logger.error(f"❌ Erro ao obter apartamento: {e}")
-            return None
-
-    def verificar_reserva_existente(self, apartamento_id: str, codigo_reserva: str) -> bool:
-        """Verifica se uma reserva já existe"""
-        try:
-            docs = self.db.collection('pre_reservas').where(
-                'apartamentoId', '==', apartamento_id
-            ).where(
-                'codigoReservaOrigem', '==', codigo_reserva
-            ).where(
-                'origem', '==', 'airbnb'
-            ).stream()
-
-            existe = len(list(docs)) > 0
-            
-            if existe:
-                logger.info(f"ℹ️  Reserva {codigo_reserva} já existe, pulando...")
-            
-            return existe
-        except Exception as e:
-            logger.error(f"❌ Erro ao verificar reserva: {e}")
-            return False
-
-    def criar_pre_reserva(self, dados: Dict, apartamento_id: str) -> bool:
-        """Cria uma pré-reserva no Firestore"""
-        try:
-            # Converter valor
-            valor = 0
+    def processar_emails(self, max_results: int = 10):
+        """Processa e-mails de reservas do Airbnb, salvando/atualizando no Firestore."""
+        messages = self.buscar_emails_reservas(max_results=max_results)
+        
+        for msg in messages:
+            msg_id = msg['id']
             try:
-                valor_str = dados['valor'].replace('.', '').replace(',', '.')
-                valor = float(valor_str)
-            except:
-                pass
-
-            pre_reserva = {
-                'nome': dados['nome'],
-                'dataCheckin': dados['dataCheckin'],
-                'dataCheckout': dados['dataCheckout'],
-                'apartamentoId': apartamento_id,
-                'origem': 'airbnb',
-                'codigoReservaOrigem': dados['codigoReserva'],
-                'status': 'pendente_validacao',
-                'valor': valor,
-                'numeroHospedes': dados.get('numeroHospedes', 1),
-                'observacao': f"Anúncio: {dados.get('anuncio', '')}",
-                'criadoEm': firestore.SERVER_TIMESTAMP
-            }
-
-            self.db.collection('pre_reservas').add(pre_reserva)
-            logger.info(f"✅ Pré-reserva criada: {dados['codigoReserva']}")
-            return True
-        except Exception as e:
-            logger.error(f"❌ Erro ao criar pré-reserva: {e}")
-            return False
-
-    def marcar_email_como_lido(self, message_id: str):
-        """Marca um e-mail como lido"""
-        try:
-            self.gmail_service.users().messages().modify(
-                userId='me',
-                id=message_id,
-                body={'removeLabelIds': ['UNREAD']}
-            ).execute()
-        except Exception as e:
-            logger.warning(f"⚠️  Erro ao marcar e-mail como lido: {e}")
-
-    def executar(self):
-        """Executa o robô de sincronização"""
-        logger.info("=" * 60)
-        logger.info("🤖 Robô de Sincronização - Airbnb via Gmail")
-        logger.info("=" * 60)
-
-        try:
-            if not self.gmail_service:
-                logger.warning("⚠️  Gmail não configurado. Pulando sincronização de e-mails.")
-                return
-
-            # Buscar e-mails
-            emails = self.buscar_emails_airbnb()
-            if not emails:
-                logger.info("ℹ️  Nenhum e-mail novo encontrado")
-                return
-
-            total_criadas = 0
-            for message in emails:
-                message_id = message['id']
+                email = self.gmail_service.users().messages().get(
+                    userId='me', id=msg_id, format='full'
+                ).execute()
                 
-                # Obter conteúdo
-                conteudo = self.obter_conteudo_email(message_id)
-                if not conteudo:
-                    logger.warning(f"⚠️  Não foi possível obter conteúdo do e-mail {message_id}")
-                    continue
+                payload = email.get('payload', {})
+                headers = payload.get('headers', [])
+                
+                assunto = self.extrair_header(headers, 'Subject') or ''
+                data_envio = self.extrair_header(headers, 'Date') or ''
+                
+                corpo = self.extrair_corpo_email(payload)
+                
+                logger.info(f"✉️ Processando e-mail ID={msg_id}, Assunto='{assunto}'")
+                
+                reserva = self.parse_reserva_airbnb(corpo)
+                reserva["assunto_email"] = assunto
+                reserva["data_envio_email"] = data_envio
+                reserva["id_email"] = msg_id
+                
+                self.salvar_reserva_no_firestore(reserva)
+            
+            except HttpError as error:
+                logger.error(f"Erro HTTP ao processar e-mail {msg_id}: {error}")
+            except Exception as e:
+                logger.error(f"Erro inesperado ao processar e-mail {msg_id}: {e}")
 
-                # Extrair dados
-                dados = self.extrair_dados_email_airbnb(conteudo)
-                if not dados:
-                    logger.warning(f"⚠️  Não foi possível extrair dados do e-mail {message_id}")
-                    self.marcar_email_como_lido(message_id)
-                    continue
-
-                # Obter apartamento
-                apartamento_id = self.obter_apartamento_por_anuncio(dados['anuncio'])
-                if not apartamento_id:
-                    logger.warning(f"⚠️  Apartamento não encontrado para: {dados['anuncio']}")
-                    self.marcar_email_como_lido(message_id)
-                    continue
-
-                # Verificar se já existe
-                if self.verificar_reserva_existente(apartamento_id, dados['codigoReserva']):
-                    self.marcar_email_como_lido(message_id)
-                    continue
-
-                # Criar pré-reserva
-                if self.criar_pre_reserva(dados, apartamento_id):
-                    total_criadas += 1
-                    self.marcar_email_como_lido(message_id)
-
-            logger.info("=" * 60)
-            logger.info(f"✅ Sincronização concluída: {total_criadas} pré-reservas criadas")
-            logger.info("=" * 60)
-
+    # ---------------------------------------------------------
+    # Integração com Firestore
+    # ---------------------------------------------------------
+    def salvar_reserva_no_firestore(self, reserva: Dict):
+        """
+        Salva ou atualiza uma reserva no Firestore.
+        A coleção e chave podem ser adaptadas de acordo com a sua estrutura.
+        """
+        try:
+            # Exemplo: coleção 'reservas_airbnb', documento pelo 'codigo_reserva' ou 'id_email'
+            colecao = "reservas_airbnb"
+            doc_id = reserva.get("codigo_reserva") or reserva.get("id_email")
+            
+            if not doc_id:
+                logger.warning(f"⚠️ Reserva sem identificador único, não será salva: {reserva}")
+                return
+            
+            doc_ref = self.db.collection(colecao).document(doc_id)
+            
+            # Adiciona timestamp de sincronização
+            reserva["sincronizado_em"] = datetime.utcnow().isoformat()
+            
+            doc_ref.set(reserva, merge=True)
+            logger.info(f"💾 Reserva salva/atualizada no Firestore: {colecao}/{doc_id}")
+        
         except Exception as e:
-            logger.error(f"❌ Erro durante a sincronização: {e}")
-            sys.exit(1)
+            logger.error(f"Erro ao salvar reserva no Firestore: {e}")
+
+    # ---------------------------------------------------------
+    # Loop principal
+    # ---------------------------------------------------------
+    def executar_uma_vez(self):
+        """Executa uma varredura única de e-mails e processa as reservas."""
+        logger.info("🚀 Executando sincronização única de reservas (Airbnb ↔ Gmail ↔ Firebase)")
+        self.processar_emails()
+
+    def executar_continuamente(self):
+        """Executa o robô em loop, verificando e-mails periodicamente."""
+        logger.info("🔁 Iniciando execução contínua do robô de sincronização.")
+        try:
+            while True:
+                self.executar_uma_vez()
+                logger.info(f"⏳ Aguardando {self.intervalo_segundos} segundos para nova verificação...")
+                time.sleep(self.intervalo_segundos)
+        except KeyboardInterrupt:
+            logger.info("🛑 Execução interrompida manualmente.")
 
 
 def main():
-    """Função principal"""
-    robo = RoboGmailAirbnb()
-    robo.executar()
+    modo = os.getenv("SYNC_MODE", "once").lower()
+    
+    bot = AirbnbGmailSyncBot()
+    
+    if modo == "continuous":
+        bot.executar_continuamente()
+    else:
+        bot.executar_uma_vez()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
