@@ -62,7 +62,7 @@ class AirbnbGmailSyncBot:
         self.email_user = os.getenv('GMAIL_USER_EMAIL', '')
         self.search_query = os.getenv(
             'GMAIL_SEARCH_QUERY',
-            'from:(express@airbnb.com) subject:(Confirmação de reserva)'
+            'from:(tiagoddantas@me.com) subject:(Enc: Reserva confirmada -)'
         )
         
         # Tempo entre execuções em modo contínuo (em segundos)
