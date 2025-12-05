@@ -106,7 +106,6 @@ class AirbnbGmailSyncBot:
     def inicializar_gmail(self):
         """Inicializa a conexão com Gmail API"""
         try:
-            # Obter credenciais do ambiente
             client_id = os.getenv('GOOGLE_CLIENT_ID')
             client_secret = os.getenv('GOOGLE_CLIENT_SECRET')
             refresh_token = os.getenv('GOOGLE_REFRESH_TOKEN')
@@ -145,7 +144,6 @@ class AirbnbGmailSyncBot:
     # Funções utilitárias
     # ---------------------------------------------------------
     def _decode_part_body(self, part: Dict) -> str:
-        """Decodifica o body de uma parte do e-mail se tiver 'data'."""
         body = part.get("body", {})
         data = body.get("data")
         if not data:
@@ -158,19 +156,13 @@ class AirbnbGmailSyncBot:
             return ""
 
     def _buscar_html_ou_texto(self, payload: Dict) -> str:
-        """
-        Procura recursivamente uma parte text/html.
-        Se não encontrar, cai para text/plain como fallback.
-        """
+        """Procura recursivamente text/html; se não achar, usa text/plain."""
         mime_type = payload.get("mimeType", "")
 
-        # Se já é text/html
         if mime_type.startswith("text/html"):
             return self._decode_part_body(payload)
 
-        # Se tem subpartes, procura nelas primeiro
         if "parts" in payload:
-            html_fallback = ""
             text_fallback = ""
             for part in payload["parts"]:
                 mt = part.get("mimeType", "")
@@ -181,31 +173,22 @@ class AirbnbGmailSyncBot:
                 elif mt.startswith("text/plain") and not text_fallback:
                     text_fallback = self._decode_part_body(part)
 
-                # Recursivo para estruturas mais profundas
                 if "parts" in part:
                     sub = self._buscar_html_ou_texto(part)
-                    # Se encontrar HTML, retorna
                     if sub and ("<html" in sub.lower() or "<body" in sub.lower()):
                         return sub
-                    # Senão, guarda como fallback de texto se ainda não tiver
                     if sub and not text_fallback:
                         text_fallback = sub
 
-            # Se não achou HTML, devolve texto
-            if html_fallback:
-                return html_fallback
             if text_fallback:
                 return text_fallback
 
-        # Se for text/plain direto
         if mime_type.startswith("text/plain"):
             return self._decode_part_body(payload)
 
-        # Fallback vazio
         return ""
 
     def extrair_corpo_email(self, message_payload: Dict) -> str:
-        """Extrai o corpo em HTML (preferencial) ou texto simples do e-mail."""
         try:
             corpo = self._buscar_html_ou_texto(message_payload)
             return corpo or ""
@@ -214,32 +197,25 @@ class AirbnbGmailSyncBot:
             return ""
 
     def extrair_header(self, headers: List[Dict], name: str) -> Optional[str]:
-        """Extrai um header específico por nome"""
         for h in headers:
             if h.get('name', '').lower() == name.lower():
                 return h.get('value', '')
         return None
 
     def _limpar_html(self, texto: str) -> str:
-        """Remove tags HTML e normaliza espaços."""
         if not texto:
             return ""
-        # remove tags
         sem_tags = re.sub(r'<[^>]+>', ' ', texto)
-        # normaliza espaços
         sem_tags = re.sub(r'\s+', ' ', sem_tags)
         return sem_tags.strip()
 
     # ---------------------------------------------------------
-    # Helpers específicos para hospede e nomeApAirbnb
+    # Helpers específicos
     # ---------------------------------------------------------
     def _extrair_hospede_do_assunto(self, assunto: str) -> Optional[str]:
         """
-        Extrai o nome do hóspede a partir do assunto, entre:
-        'Enc: Reserva confirmada - ' e ' chega'
-        Exemplo:
-        Enc: Reserva confirmada - Letícia chega em 18 de fev. de 2026
-        => hospede = 'Letícia'
+        Entre: 'Enc: Reserva confirmada - ' e ' chega'
+        Ex: Enc: Reserva confirmada - Letícia chega em 18 de fev. de 2026
         """
         if not assunto:
             return None
@@ -254,11 +230,7 @@ class AirbnbGmailSyncBot:
 
     def _extrair_nomeap_envie_mensagem(self, email_body: str, hospede: str) -> Optional[str]:
         """
-        Extrai o nome do apartamento a partir da frase:
-        'Envie uma Mensagem para {HOSPEDE} {NOME_AP}'
-        Exemplo:
-        Envie uma Mensagem para Letícia Eco Resort Praia dos Carneiros - Flat Colina
-        => nomeApAirbnb = 'Eco Resort Praia dos Carneiros - Flat Colina'
+        Fallback: 'Envie uma Mensagem para {HOSPEDE} {NOME_AP}'
         """
         if not email_body or not hospede:
             return None
@@ -269,19 +241,7 @@ class AirbnbGmailSyncBot:
             return m.group(1).strip()
         return None
 
-    # ---------------------------------------------------------
-    # Parsing de datas PT-BR (incluindo abreviações Airbnb)
-    # ---------------------------------------------------------
     def _parse_data_pt_br(self, data_str: str) -> str:
-        """
-        Converte uma data em português para formato ISO (YYYY-MM-DD).
-
-        Exemplos aceitos:
-        - "qua., 18 de fev. de 2026"
-        - "dom., 22 de fev. de 2026"
-        - "18 de fevereiro de 2026"
-        - "10 dezembro 2025"
-        """
         meses = {
             "jan": 1, "jan.": 1, "janeiro": 1,
             "fev": 2, "fev.": 2, "fevereiro": 2,
@@ -296,17 +256,13 @@ class AirbnbGmailSyncBot:
             "nov": 11, "nov.": 11, "novembro": 11,
             "dez": 12, "dez.": 12, "dezembro": 12,
         }
-        
         try:
             if not data_str:
                 return data_str
 
             s = data_str.lower().strip()
-
-            # Remove dia da semana no início, ex: "qua., ", "dom. "
             s = re.sub(r'^[a-zç\.]{3,},?\s*', '', s)
 
-            # Tenta padrão "18 de fev. de 2026"
             m = re.search(r'(\d{1,2})\s+de\s+([a-zç\.]+)\s+de\s+(\d{4})', s)
             if m:
                 dia = int(m.group(1))
@@ -316,7 +272,6 @@ class AirbnbGmailSyncBot:
                 dt = datetime(ano, mes, dia)
                 return dt.strftime("%Y-%m-%d")
 
-            # Fallback: "10 dezembro 2025"
             s2 = s.replace(" de ", " ")
             partes = s2.split()
             if len(partes) == 3:
@@ -329,19 +284,12 @@ class AirbnbGmailSyncBot:
 
         except Exception as e:
             logger.error(f"Erro ao converter data '{data_str}': {e}")
-        
-        # Em caso de falha, retorna a string original
         return data_str
 
     # ---------------------------------------------------------
-    # Parsing de e-mail Airbnb (HTML + texto)
+    # Parsing do e-mail
     # ---------------------------------------------------------
     def parse_reserva_airbnb(self, email_body: str) -> Dict:
-        """
-        Interpreta o corpo de e-mail do Airbnb para extrair dados da reserva.
-        (hóspede e nomeApAirbnb serão refinados no processar_emails com base no assunto
-        e na frase 'Envie uma Mensagem para {hospede} ...')
-        """
         reserva = {
             "origem": "airbnb",
             "status": "pendente",
@@ -359,9 +307,16 @@ class AirbnbGmailSyncBot:
             html = email_body or ""
             texto_limpo = self._limpar_html(html)
 
-            # ===================================================
-            # Datas de check-in e check-out (mantendo lógica anterior)
-            # ===================================================
+            # -------- nomeApAirbnb: PRIMEIRO <h2> --------
+            match_h2 = re.search(
+                r'<h2[^>]*>(.*?)</h2>',
+                html,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            if match_h2:
+                reserva["nomeApAirbnb"] = self._limpar_html(match_h2.group(1))
+
+            # -------- Datas --------
             padrao_datas_html = (
                 r'<p[^>]*font-size:22px;line-height:26px;[^>]*>'
                 r'(.*?)</p>'
@@ -372,11 +327,9 @@ class AirbnbGmailSyncBot:
                 flags=re.IGNORECASE | re.DOTALL
             )
             if datas_html:
-                checkin_str = self._limpar_html(datas_html[0])
-                reserva["checkin"] = self._parse_data_pt_br(checkin_str)
+                reserva["checkin"] = self._parse_data_pt_br(self._limpar_html(datas_html[0]))
                 if len(datas_html) > 1:
-                    checkout_str = self._limpar_html(datas_html[1])
-                    reserva["checkout"] = self._parse_data_pt_br(checkout_str)
+                    reserva["checkout"] = self._parse_data_pt_br(self._limpar_html(datas_html[1]))
 
             if not reserva["checkin"] or not reserva["checkout"]:
                 datas_txt = re.findall(
@@ -389,9 +342,7 @@ class AirbnbGmailSyncBot:
                 if len(datas_txt) >= 2 and not reserva["checkout"]:
                     reserva["checkout"] = self._parse_data_pt_br(datas_txt[1])
 
-            # ===================================================
-            # Código da reserva
-            # ===================================================
+            # -------- Código da reserva --------
             match_codigo_tag = re.search(
                 r'<p[^>]*font-size:18px;line-height:28px;font-family[Cereal\s\:;#0-9a-zA-Z\-,"\.]*'
                 r'font-weight:400[^>]*margin:0!important[^>]*>(.*?)</p>',
@@ -409,9 +360,7 @@ class AirbnbGmailSyncBot:
                 if possiveis_codigos:
                     reserva["codigo_reserva"] = possiveis_codigos[0]
 
-            # ===================================================
-            # quantidade_hospedes (adultos + crianças + bebês)
-            # ===================================================
+            # -------- quantidade_hospedes --------
             blocos_hosp = re.findall(
                 r'<p[^>]*font-weight:400!important[^>]*>(.*?)</p>',
                 html,
@@ -437,10 +386,7 @@ class AirbnbGmailSyncBot:
                 ):
                     reserva["quantidade_hospedes"] += int(m.group(1))
 
-            # ===================================================
-            # valor_total (primeiro R$ encontrado como fallback geral)
-            # (regra "você recebe" será aplicada depois em texto_limpo, se existir)
-            # ===================================================
+            # -------- valor_total (fallback geral) --------
             m_val_txt = re.search(r'R\$\s*([\d\.\,]+)', texto_limpo)
             if m_val_txt:
                 v = m_val_txt.group(1).strip()
@@ -458,10 +404,9 @@ class AirbnbGmailSyncBot:
         return reserva
 
     # ---------------------------------------------------------
-    # Integração com Gmail
+    # Gmail + Firestore
     # ---------------------------------------------------------
     def buscar_emails_reservas(self, max_results: int = 10) -> List[Dict]:
-        """Busca e-mails de confirmação de reserva do Airbnb."""
         try:
             logger.info(f"🔎 Buscando e-mails no Gmail com query: {self.search_query}")
             results = self.gmail_service.users().messages().list(
@@ -478,7 +423,6 @@ class AirbnbGmailSyncBot:
             return []
 
     def processar_emails(self, max_results: int = 10):
-        """Processa e-mails de reservas do Airbnb, salvando/atualizando no Firestore."""
         messages = self.buscar_emails_reservas(max_results=max_results)
         
         for msg in messages:
@@ -498,21 +442,20 @@ class AirbnbGmailSyncBot:
                 
                 logger.info(f"✉️ Processando e-mail ID={msg_id}, Assunto='{assunto}'")
                 
-                # Parsing principal (datas, código, quantidade, valor básico)
                 reserva = self.parse_reserva_airbnb(corpo)
 
-                # 🔹 1) Hóspede a partir do ASSUNTO:
+                # hóspede a partir do assunto
                 hospede_assunto = self._extrair_hospede_do_assunto(assunto)
                 if hospede_assunto:
                     reserva["hospede"] = hospede_assunto
 
-                # 🔹 2) nomeApAirbnb a partir da frase "Envie uma Mensagem para {hospede} ..."
-                if reserva.get("hospede"):
+                # nomeApAirbnb via "Envie uma Mensagem..." APENAS se não veio pelo <h2>
+                if reserva.get("hospede") and not reserva.get("nomeApAirbnb"):
                     nome_apt = self._extrair_nomeap_envie_mensagem(corpo, reserva["hospede"])
                     if nome_apt:
                         reserva["nomeApAirbnb"] = nome_apt
 
-                # 🔹 3) valor_total a partir de "você recebe R$..."
+                # valor_total via "você recebe R$..."
                 texto_limpo = self._limpar_html(corpo or "")
                 m_val_voce = re.search(
                     r'voc[êe]\s+recebe[^R$]*R\$\s*([\d\.\,]+)',
@@ -538,15 +481,7 @@ class AirbnbGmailSyncBot:
             except Exception as e:
                 logger.error(f"Erro inesperado ao processar e-mail {msg_id}: {e}")
 
-    # ---------------------------------------------------------
-    # Integração com Firestore
-    # ---------------------------------------------------------
     def salvar_reserva_no_firestore(self, reserva: Dict):
-        """
-        Salva ou atualiza uma reserva no Firestore.
-        Coleção: reservas_airbnb
-        Documento: codigo_reserva ou id_email (fallback).
-        """
         try:
             colecao = "reservas_airbnb"
             doc_id = reserva.get("codigo_reserva") or reserva.get("id_email")
@@ -556,10 +491,7 @@ class AirbnbGmailSyncBot:
                 return
             
             doc_ref = self.db.collection(colecao).document(doc_id)
-            
-            # Adiciona timestamp de sincronização
             reserva["sincronizado_em"] = datetime.utcnow().isoformat()
-            
             doc_ref.set(reserva, merge=True)
             logger.info(f"💾 Reserva salva/atualizada no Firestore: {colecao}/{doc_id}")
         
@@ -570,12 +502,10 @@ class AirbnbGmailSyncBot:
     # Loop principal
     # ---------------------------------------------------------
     def executar_uma_vez(self):
-        """Executa uma varredura única de e-mails e processa as reservas."""
         logger.info("🚀 Executando sincronização única de reservas (Airbnb ↔ Gmail ↔ Firebase)")
         self.processar_emails()
 
     def executar_continuamente(self):
-        """Executa o robô em loop, verificando e-mails periodicamente."""
         logger.info("🔁 Iniciando execução contínua do robô de sincronização.")
         try:
             while True:
@@ -588,9 +518,7 @@ class AirbnbGmailSyncBot:
 
 def main():
     modo = os.getenv("SYNC_MODE", "once").lower()
-    
     bot = AirbnbGmailSyncBot()
-    
     if modo == "continuous":
         bot.executar_continuamente()
     else:
