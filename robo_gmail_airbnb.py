@@ -21,7 +21,7 @@ import logging
 import base64
 import re
 from typing import List, Dict, Optional
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # Firebase Admin
 import firebase_admin
@@ -63,7 +63,7 @@ class AirbnbGmailSyncBot:
         self.email_user = os.getenv('GMAIL_USER_EMAIL', '')
         self.search_query = os.getenv(
             'GMAIL_SEARCH_QUERY',
-            'from:(tiagoddantas@me.com) subject:(Enc: Reserva confirmada -)'
+            'from:(express@airbnb.com) subject:(Confirmação de reserva)'
         )
         
         # Tempo entre execuções em modo contínuo (em segundos)
@@ -144,26 +144,71 @@ class AirbnbGmailSyncBot:
     # ---------------------------------------------------------
     # Funções utilitárias
     # ---------------------------------------------------------
-    def extrair_corpo_email(self, message_payload: Dict) -> str:
-        """Extrai o corpo em texto do e-mail (em HTML ou texto simples)"""
-        try:
-            if 'parts' in message_payload:
-                parts = message_payload['parts']
-                for part in parts:
-                    body = part.get('body', {})
-                    data = body.get('data')
-                    if data:
-                        decoded_bytes = base64.urlsafe_b64decode(data)
-                        decoded_text = decoded_bytes.decode('utf-8', errors='ignore')
-                        return decoded_text
-            else:
-                body = message_payload.get('body', {})
-                data = body.get('data')
-                if data:
-                    decoded_bytes = base64.urlsafe_b64decode(data)
-                    decoded_text = decoded_bytes.decode('utf-8', errors='ignore')
-                    return decoded_text
+    def _decode_part_body(self, part: Dict) -> str:
+        """Decodifica o body de uma parte do e-mail se tiver 'data'."""
+        body = part.get("body", {})
+        data = body.get("data")
+        if not data:
             return ""
+        try:
+            decoded_bytes = base64.urlsafe_b64decode(data)
+            return decoded_bytes.decode("utf-8", errors="ignore")
+        except Exception as e:
+            logger.error(f"Erro ao decodificar parte do e-mail: {e}")
+            return ""
+
+    def _buscar_html_ou_texto(self, payload: Dict) -> str:
+        """
+        Procura recursivamente uma parte text/html.
+        Se não encontrar, cai para text/plain como fallback.
+        """
+        mime_type = payload.get("mimeType", "")
+
+        # Se já é text/html
+        if mime_type.startswith("text/html"):
+            return self._decode_part_body(payload)
+
+        # Se tem subpartes, procura nelas primeiro
+        if "parts" in payload:
+            html_fallback = ""
+            text_fallback = ""
+            for part in payload["parts"]:
+                mt = part.get("mimeType", "")
+                if mt.startswith("text/html"):
+                    html = self._decode_part_body(part)
+                    if html:
+                        return html
+                elif mt.startswith("text/plain") and not text_fallback:
+                    text_fallback = self._decode_part_body(part)
+
+                # Recursivo para estruturas mais profundas
+                if "parts" in part:
+                    sub = self._buscar_html_ou_texto(part)
+                    # Se encontrar HTML, retorna
+                    if sub and ("<html" in sub.lower() or "<body" in sub.lower()):
+                        return sub
+                    # Senão, guarda como fallback de texto se ainda não tiver
+                    if sub and not text_fallback:
+                        text_fallback = sub
+
+            # Se não achou HTML, devolve texto
+            if html_fallback:
+                return html_fallback
+            if text_fallback:
+                return text_fallback
+
+        # Se for text/plain direto
+        if mime_type.startswith("text/plain"):
+            return self._decode_part_body(payload)
+
+        # Fallback vazio
+        return ""
+
+    def extrair_corpo_email(self, message_payload: Dict) -> str:
+        """Extrai o corpo em HTML (preferencial) ou texto simples do e-mail."""
+        try:
+            corpo = self._buscar_html_ou_texto(message_payload)
+            return corpo or ""
         except Exception as e:
             logger.error(f"Erro ao extrair corpo de e-mail: {e}")
             return ""
@@ -180,7 +225,7 @@ class AirbnbGmailSyncBot:
         if not texto:
             return ""
         # remove tags
-        sem_tags = re.sub(r'<[^>]+>', '', texto)
+        sem_tags = re.sub(r'<[^>]+>', ' ', texto)
         # normaliza espaços
         sem_tags = re.sub(r'\s+', ' ', sem_tags)
         return sem_tags.strip()
@@ -194,11 +239,12 @@ class AirbnbGmailSyncBot:
 
         Exemplos aceitos:
         - "qua., 18 de fev. de 2026"
+        - "dom., 22 de fev. de 2026"
         - "18 de fevereiro de 2026"
         - "10 dezembro 2025"
         """
         meses = {
-            "jan": 1, "janeiro": 1,
+            "jan": 1, "jan.": 1, "janeiro": 1,
             "fev": 2, "fev.": 2, "fevereiro": 2,
             "mar": 3, "mar.": 3, "marco": 3, "março": 3,
             "abr": 4, "abr.": 4, "abril": 4,
@@ -225,9 +271,9 @@ class AirbnbGmailSyncBot:
             m = re.search(r'(\d{1,2})\s+de\s+([a-zç\.]+)\s+de\s+(\d{4})', s)
             if m:
                 dia = int(m.group(1))
-                mes_token = m.group(2).strip().rstrip('.')
+                mes_token = m.group(2).strip()
                 ano = int(m.group(3))
-                mes = meses.get(mes_token, meses.get(mes_token + '.', 1))
+                mes = meses.get(mes_token, meses.get(mes_token.rstrip('.'), 1))
                 dt = datetime(ano, mes, dia)
                 return dt.strftime("%Y-%m-%d")
 
@@ -236,9 +282,9 @@ class AirbnbGmailSyncBot:
             partes = s2.split()
             if len(partes) == 3:
                 dia = int(partes[0])
-                mes_nome = partes[1].strip().rstrip('.')
+                mes_nome = partes[1].strip()
                 ano = int(partes[2])
-                mes = meses.get(mes_nome, meses.get(mes_nome + '.', 1))
+                mes = meses.get(mes_nome, meses.get(mes_nome.rstrip('.'), 1))
                 dt = datetime(ano, mes, dia)
                 return dt.strftime("%Y-%m-%d")
 
@@ -249,20 +295,17 @@ class AirbnbGmailSyncBot:
         return data_str
 
     # ---------------------------------------------------------
-    # Parsing de e-mail Airbnb (HTML)
+    # Parsing de e-mail Airbnb (HTML + fallback em texto)
     # ---------------------------------------------------------
     def parse_reserva_airbnb(self, email_body: str) -> Dict:
         """
         Interpreta o corpo de e-mail do Airbnb para extrair dados da reserva,
-        usando especificamente os elementos informados:
-
-        1) <h2> ... nome do apto -> nomeApAirbnb
-        2) <p style="font-size:22px..."> data check-in (primeiro) -> checkin
-        3) <p style="font-size:22px..."> data check-out (segundo) -> checkout
-        4) <p style="font-size:18px;...font-weight:400..."> HMB39THXQK -> codigo_reserva
-        5) <p style="font-size:18px;...font-weight:700!..."> Letícia -> hospede
-        6) <p style="font-size:18px;...font-weight:400!..."> "2 adultos" ou "2 adultos, 1 criança" -> quantidade_hospedes (soma)
-        7) <h3 style="font-size:18px;...text-align:right!...">R$1.717,53</h3> -> valor_total
+        usando:
+        - HTML quando possível
+        - Regras específicas de texto que você definiu:
+          • valor_total: logo após "você recebe"
+          • hospede: nome logo após "Nova reserva confirmada!"
+          • nomeApAirbnb: texto antes de "Casa/apto inteiro"
         """
         reserva = {
             "origem": "airbnb",
@@ -278,69 +321,123 @@ class AirbnbGmailSyncBot:
         }
         
         try:
-            html = email_body
+            html = email_body or ""
+            texto_limpo = self._limpar_html(html)
 
-            # -------- 1) Nome do apartamento (h2) --------
-            match_nome = re.search(
-                r'<h2[^>]*>(.*?)</h2>',
+            # ===================================================
+            # 1) nomeApAirbnb
+            # ===================================================
+            # Regra que você pediu: texto ANTES de "Casa/apto inteiro"
+            m_nome_casa = re.search(
+                r'([^\n]+?)\s+Casa/apto inteiro',
+                texto_limpo,
+                flags=re.IGNORECASE
+            )
+            if m_nome_casa:
+                reserva["nomeApAirbnb"] = m_nome_casa.group(1).strip()
+
+            # Fallback: primeiro <h2> (se houver)
+            if not reserva["nomeApAirbnb"]:
+                match_nome_h2 = re.search(
+                    r'<h2[^>]*>(.*?)</h2>',
+                    html,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
+                if match_nome_h2:
+                    reserva["nomeApAirbnb"] = self._limpar_html(match_nome_h2.group(1))
+
+            # ===================================================
+            # 2) Datas de check-in e check-out
+            # ===================================================
+            # HTML: <p style="font-size:22px;line-height:26px;...">data</p>
+            padrao_datas_html = (
+                r'<p[^>]*font-size:22px;line-height:26px;[^>]*>'
+                r'(.*?)</p>'
+            )
+            datas_html = re.findall(
+                padrao_datas_html,
                 html,
                 flags=re.IGNORECASE | re.DOTALL
             )
-            if match_nome:
-                nome_raw = match_nome.group(1)
-                reserva["nomeApAirbnb"] = self._limpar_html(nome_raw)
-            
-            # -------- 2) & 3) Datas de check-in e check-out --------
-            # <p style="font-size:22px;line-height:26px;...">qua., 18 de fev. de 2026</p>
-            padrao_datas = (
-                r'<p[^>]*font-size:22px;line-height:26px;'
-                r'color:#222222;font-family:Cereal[^>]*>(.*?)</p>'
-            )
-            datas = re.findall(padrao_datas, html, flags=re.IGNORECASE | re.DOTALL)
-            if datas:
+            if datas_html:
                 # Primeiro p = check-in
-                checkin_str = self._limpar_html(datas[0])
+                checkin_str = self._limpar_html(datas_html[0])
                 reserva["checkin"] = self._parse_data_pt_br(checkin_str)
-
                 # Segundo p (se existir) = check-out
-                if len(datas) > 1:
-                    checkout_str = self._limpar_html(datas[1])
+                if len(datas_html) > 1:
+                    checkout_str = self._limpar_html(datas_html[1])
                     reserva["checkout"] = self._parse_data_pt_br(checkout_str)
 
-            # -------- 4) Código da reserva --------
-            # <p style="font-size:18px;line-height:28px;...font-weight:400;margin:0!important">HMB39THXQK</p>
+            # Fallback em texto: pega as duas primeiras datas no padrão "qua., 18 de fev. de 2026"
+            if not reserva["checkin"] or not reserva["checkout"]:
+                datas_txt = re.findall(
+                    r'(?:seg|ter|qua|qui|sex|sáb|sab|dom)\.?,?\s*\d{1,2}\s+de\s+[a-zç\.]+\s+de\s+\d{4}',
+                    texto_limpo,
+                    flags=re.IGNORECASE
+                )
+                if len(datas_txt) >= 1 and not reserva["checkin"]:
+                    reserva["checkin"] = self._parse_data_pt_br(datas_txt[0])
+                if len(datas_txt) >= 2 and not reserva["checkout"]:
+                    reserva["checkout"] = self._parse_data_pt_br(datas_txt[1])
+
+            # ===================================================
+            # 3) Código da reserva
+            # ===================================================
+            # Mesmo padrão anterior (HTML + fallback texto)
             match_codigo_tag = re.search(
-                r'<p[^>]*font-size:18px;line-height:28px;font-family:Cereal[^>]*'
+                r'<p[^>]*font-size:18px;line-height:28px;font-family[Cereal\s\:;#0-9a-zA-Z\-,"\.]*'
                 r'font-weight:400[^>]*margin:0!important[^>]*>(.*?)</p>',
                 html,
                 flags=re.IGNORECASE | re.DOTALL
             )
             if match_codigo_tag:
                 texto_codigo = self._limpar_html(match_codigo_tag.group(1))
-                # Procura algo tipo HMB39THXQK
                 m_cod = re.search(r'\b[A-Z0-9]{6,14}\b', texto_codigo)
                 if m_cod:
                     reserva["codigo_reserva"] = m_cod.group(0).strip()
 
-            # Fallback extra para código se ainda estiver vazio
+            # Fallback geral: primeiro token alfanumérico grande (tipo HMB39THXQK)
             if not reserva["codigo_reserva"]:
-                texto_limpo = self._limpar_html(html)
                 possiveis_codigos = re.findall(r'\b[A-Z0-9]{8,14}\b', texto_limpo)
                 if possiveis_codigos:
                     reserva["codigo_reserva"] = possiveis_codigos[0]
 
-            # -------- 5) Nome do hóspede --------
-            # <p ...font-weight:700!important">Letícia</p>
-            match_hospede = re.search(
-                r'<p[^>]*font-weight:700!important[^>]*>(.*?)</p>',
-                html,
-                flags=re.IGNORECASE | re.DOTALL
+            # ===================================================
+            # 4) hospede
+            # ===================================================
+            # Regra que você pediu: nome logo após "Nova reserva confirmada!"
+            m_hosp_reserva = re.search(
+                r'Nova reserva confirmada!\s*([^\n,]+)',
+                texto_limpo,
+                flags=re.IGNORECASE
             )
-            if match_hospede:
-                reserva["hospede"] = self._limpar_html(match_hospede.group(1))
+            if m_hosp_reserva:
+                reserva["hospede"] = m_hosp_reserva.group(1).strip()
 
-            # -------- 6) Quantidade de hóspedes (adultos + crianças + bebês) --------
-            # <p ...font-weight:400!important">2 adultos</p>
+            # Fallback HTML: <p ...font-weight:700!important">Letícia</p>
+            if not reserva["hospede"]:
+                match_hospede = re.search(
+                    r'<p[^>]*font-weight:700!important[^>]*>(.*?)</p>',
+                    html,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
+                if match_hospede:
+                    reserva["hospede"] = self._limpar_html(match_hospede.group(1))
+
+            # Fallback texto: padrão "Hóspede: Nome"
+            if not reserva["hospede"]:
+                m_hosp_txt = re.search(
+                    r'Hóspede(?: principal)?:\s*([A-ZÀ-Ý][^\n,]*)',
+                    texto_limpo,
+                    flags=re.IGNORECASE
+                )
+                if m_hosp_txt:
+                    reserva["hospede"] = m_hosp_txt.group(1).strip()
+
+            # ===================================================
+            # 5) quantidade_hospedes (adultos + crianças + bebês)
+            # ===================================================
+            # HTML: p com font-weight:400!important contendo "2 adultos", "1 criança" etc.
             blocos_hosp = re.findall(
                 r'<p[^>]*font-weight:400!important[^>]*>(.*?)</p>',
                 html,
@@ -349,27 +446,67 @@ class AirbnbGmailSyncBot:
             for bloco in blocos_hosp:
                 texto = self._limpar_html(bloco).lower()
                 if any(p in texto for p in ["adult", "crian", "beb"]):
-                    numeros = [int(n) for n in re.findall(r'(\d+)', texto)]
-                    if numeros:
-                        reserva["quantidade_hospedes"] = sum(numeros)
+                    for m in re.finditer(
+                        r'(\d+)\s+(adulto|adultos|criança|crianças|bebê|bebês)',
+                        texto,
+                        flags=re.IGNORECASE
+                    ):
+                        reserva["quantidade_hospedes"] += int(m.group(1))
+                    if reserva["quantidade_hospedes"] > 0:
                         break
 
-            # -------- 7) Valor total --------
-            # <h3 ...text-align:right!important">R$1.717,53</h3>
-            match_valor_tag = re.search(
-                r'<h3[^>]*text-align:right!important[^>]*>(.*?)</h3>',
-                html,
-                flags=re.IGNORECASE | re.DOTALL
+            # Fallback texto: procurar no texto limpo
+            if reserva["quantidade_hospedes"] == 0:
+                for m in re.finditer(
+                    r'(\d+)\s+(adulto|adultos|criança|crianças|bebê|bebês)',
+                    texto_limpo,
+                    flags=re.IGNORECASE
+                ):
+                    reserva["quantidade_hospedes"] += int(m.group(1))
+
+            # ===================================================
+            # 6) valor_total
+            # ===================================================
+            # Regra que você pediu: valor logo após "você recebe"
+            m_val_voce = re.search(
+                r'voc[êe]\s+recebe[^R$]*R\$\s*([\d\.\,]+)',
+                texto_limpo,
+                flags=re.IGNORECASE
             )
-            if match_valor_tag:
-                valor_txt = self._limpar_html(match_valor_tag.group(1))
-                # Ex: "R$1.717,53" ou "R$ 1.717,53"
-                valor_sem_simbolo = valor_txt.replace('R$', '').strip()
-                valor_sem_simbolo = valor_sem_simbolo.replace('.', '').replace(',', '.')
+            if m_val_voce:
+                v = m_val_voce.group(1).strip()
+                v = v.replace('.', '').replace(',', '.')
                 try:
-                    reserva["valor_total"] = float(valor_sem_simbolo)
+                    reserva["valor_total"] = float(v)
                 except Exception as e:
-                    logger.error(f"Erro ao converter valor_total '{valor_txt}': {e}")
+                    logger.error(f"Erro ao converter valor_total (você recebe) '{v}': {e}")
+
+            # Fallback HTML: <h3 ...text-align:right!important">R$1.717,53</h3>
+            if reserva["valor_total"] == 0:
+                match_valor_tag = re.search(
+                    r'<h3[^>]*text-align:right!important[^>]*>(.*?)</h3>',
+                    html,
+                    flags=re.IGNORECASE | re.DOTALL
+                )
+                if match_valor_tag:
+                    valor_txt = self._limpar_html(match_valor_tag.group(1))
+                    valor_sem_simbolo = valor_txt.replace('R$', '').strip()
+                    valor_sem_simbolo = valor_sem_simbolo.replace('.', '').replace(',', '.')
+                    try:
+                        reserva["valor_total"] = float(valor_sem_simbolo)
+                    except Exception as e:
+                        logger.error(f"Erro ao converter valor_total '{valor_txt}': {e}")
+
+            # Fallback extra: primeira ocorrência de "R$"
+            if reserva["valor_total"] == 0:
+                m_val_txt = re.search(r'R\$\s*([\d\.\,]+)', texto_limpo)
+                if m_val_txt:
+                    v = m_val_txt.group(1).strip()
+                    v = v.replace('.', '').replace(',', '.')
+                    try:
+                        reserva["valor_total"] = float(v)
+                    except Exception as e:
+                        logger.error(f"Erro ao converter valor_total fallback '{v}': {e}")
 
             logger.info(f"📦 Reserva Airbnb parseada: {reserva}")
 
