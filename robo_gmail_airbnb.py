@@ -307,7 +307,7 @@ class AirbnbGmailSyncBot:
             html = email_body or ""
             texto_limpo = self._limpar_html(html)
 
-            # -------- nomeApAirbnb: PRIMEIRO <h2> --------
+            # nomeApAirbnb: PRIMEIRO <h2>
             match_h2 = re.search(
                 r'<h2[^>]*>(.*?)</h2>',
                 html,
@@ -316,7 +316,7 @@ class AirbnbGmailSyncBot:
             if match_h2:
                 reserva["nomeApAirbnb"] = self._limpar_html(match_h2.group(1))
 
-            # -------- Datas --------
+            # Datas
             padrao_datas_html = (
                 r'<p[^>]*font-size:22px;line-height:26px;[^>]*>'
                 r'(.*?)</p>'
@@ -342,7 +342,7 @@ class AirbnbGmailSyncBot:
                 if len(datas_txt) >= 2 and not reserva["checkout"]:
                     reserva["checkout"] = self._parse_data_pt_br(datas_txt[1])
 
-            # -------- Código da reserva --------
+            # Código da reserva
             match_codigo_tag = re.search(
                 r'<p[^>]*font-size:18px;line-height:28px;font-family[Cereal\s\:;#0-9a-zA-Z\-,"\.]*'
                 r'font-weight:400[^>]*margin:0!important[^>]*>(.*?)</p>',
@@ -360,7 +360,7 @@ class AirbnbGmailSyncBot:
                 if possiveis_codigos:
                     reserva["codigo_reserva"] = possiveis_codigos[0]
 
-            # -------- quantidade_hospedes --------
+            # quantidade_hospedes
             blocos_hosp = re.findall(
                 r'<p[^>]*font-weight:400!important[^>]*>(.*?)</p>',
                 html,
@@ -386,7 +386,7 @@ class AirbnbGmailSyncBot:
                 ):
                     reserva["quantidade_hospedes"] += int(m.group(1))
 
-            # -------- valor_total (fallback geral) --------
+            # valor_total (fallback geral)
             m_val_txt = re.search(r'R\$\s*([\d\.\,]+)', texto_limpo)
             if m_val_txt:
                 v = m_val_txt.group(1).strip()
@@ -482,6 +482,11 @@ class AirbnbGmailSyncBot:
                 logger.error(f"Erro inesperado ao processar e-mail {msg_id}: {e}")
 
     def salvar_reserva_no_firestore(self, reserva: Dict):
+        """
+        Salva ou atualiza uma reserva no Firestore.
+        Se o nomeApAirbnb for 'Eco Resort Praia dos Carneiros - Flat Colina',
+        grava também o apartamentoId correspondente.
+        """
         try:
             colecao = "reservas_airbnb"
             doc_id = reserva.get("codigo_reserva") or reserva.get("id_email")
@@ -489,6 +494,10 @@ class AirbnbGmailSyncBot:
             if not doc_id:
                 logger.warning(f"⚠️ Reserva sem identificador único, não será salva: {reserva}")
                 return
+
+            # 🔒 Regra pedida: vincular apartamentoId pelo nome do anúncio
+            if reserva.get("nomeApAirbnb") == "Eco Resort Praia dos Carneiros - Flat Colina":
+                reserva["apartamentoId"] = "cHqxxuHbV8dyusWgXYHG"
             
             doc_ref = self.db.collection(colecao).document(doc_id)
             reserva["sincronizado_em"] = datetime.utcnow().isoformat()
