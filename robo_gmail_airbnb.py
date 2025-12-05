@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
 Robô de Sincronização de Reservas entre Gmail, Airbnb e Firebase.
 
@@ -62,7 +63,7 @@ class AirbnbGmailSyncBot:
         self.email_user = os.getenv('GMAIL_USER_EMAIL', '')
         self.search_query = os.getenv(
             'GMAIL_SEARCH_QUERY',
-            'from:(tiagoddantas@me.com) subject:(Enc: Reserva confirmada -)'
+            'from:(tiagoddantas@me.com) subject:(Enc: Confirmação de reserva)'
         )
         
         # Tempo entre execuções em modo contínuo (em segundos)
@@ -129,7 +130,7 @@ class AirbnbGmailSyncBot:
             
             creds = Credentials.from_authorized_user_info(creds_data)
             
-            if not creds.valid and creds.expired and creds.refresh_token:
+            if (not creds.valid) and creds.expired and creds.refresh_token:
                 logger.info("🔄 Atualizando token de acesso do Gmail...")
                 creds.refresh(Request())
             
@@ -174,13 +175,94 @@ class AirbnbGmailSyncBot:
                 return h.get('value', '')
         return None
 
+    def _limpar_html(self, texto: str) -> str:
+        """Remove tags HTML e normaliza espaços."""
+        if not texto:
+            return ""
+        # remove tags
+        sem_tags = re.sub(r'<[^>]+>', '', texto)
+        # normaliza espaços
+        sem_tags = re.sub(r'\s+', ' ', sem_tags)
+        return sem_tags.strip()
+
     # ---------------------------------------------------------
-    # Parsing de e-mail Airbnb
+    # Parsing de datas PT-BR (incluindo abreviações Airbnb)
+    # ---------------------------------------------------------
+    def _parse_data_pt_br(self, data_str: str) -> str:
+        """
+        Converte uma data em português para formato ISO (YYYY-MM-DD).
+
+        Exemplos aceitos:
+        - "qua., 18 de fev. de 2026"
+        - "18 de fevereiro de 2026"
+        - "10 dezembro 2025"
+        """
+        meses = {
+            "jan": 1, "janeiro": 1,
+            "fev": 2, "fev.": 2, "fevereiro": 2,
+            "mar": 3, "mar.": 3, "marco": 3, "março": 3,
+            "abr": 4, "abr.": 4, "abril": 4,
+            "mai": 5, "mai.": 5, "maio": 5,
+            "jun": 6, "junho": 6,
+            "jul": 7, "julho": 7,
+            "ago": 8, "ago.": 8, "agosto": 8,
+            "set": 9, "set.": 9, "setembro": 9,
+            "out": 10, "out.": 10, "outubro": 10,
+            "nov": 11, "nov.": 11, "novembro": 11,
+            "dez": 12, "dez.": 12, "dezembro": 12,
+        }
+        
+        try:
+            if not data_str:
+                return data_str
+
+            s = data_str.lower().strip()
+
+            # Remove dia da semana no início, ex: "qua., ", "dom. "
+            s = re.sub(r'^[a-zç\.]{3,},?\s*', '', s)
+
+            # Tenta padrão "18 de fev. de 2026"
+            m = re.search(r'(\d{1,2})\s+de\s+([a-zç\.]+)\s+de\s+(\d{4})', s)
+            if m:
+                dia = int(m.group(1))
+                mes_token = m.group(2).strip().rstrip('.')
+                ano = int(m.group(3))
+                mes = meses.get(mes_token, meses.get(mes_token + '.', 1))
+                dt = datetime(ano, mes, dia)
+                return dt.strftime("%Y-%m-%d")
+
+            # Fallback: "10 dezembro 2025"
+            s2 = s.replace(" de ", " ")
+            partes = s2.split()
+            if len(partes) == 3:
+                dia = int(partes[0])
+                mes_nome = partes[1].strip().rstrip('.')
+                ano = int(partes[2])
+                mes = meses.get(mes_nome, meses.get(mes_nome + '.', 1))
+                dt = datetime(ano, mes, dia)
+                return dt.strftime("%Y-%m-%d")
+
+        except Exception as e:
+            logger.error(f"Erro ao converter data '{data_str}': {e}")
+        
+        # Em caso de falha, retorna a string original
+        return data_str
+
+    # ---------------------------------------------------------
+    # Parsing de e-mail Airbnb (HTML)
     # ---------------------------------------------------------
     def parse_reserva_airbnb(self, email_body: str) -> Dict:
         """
-        Interpreta o corpo de e-mail do Airbnb para extrair dados da reserva.
-        Esta função é simplificada e pode ser ajustada conforme o padrão do e-mail.
+        Interpreta o corpo de e-mail do Airbnb para extrair dados da reserva,
+        usando especificamente os elementos informados:
+
+        1) <h2> ... nome do apto -> nomeApAirbnb
+        2) <p style="font-size:22px..."> data check-in (primeiro) -> checkin
+        3) <p style="font-size:22px..."> data check-out (segundo) -> checkout
+        4) <p style="font-size:18px;...font-weight:400..."> HMB39THXQK -> codigo_reserva
+        5) <p style="font-size:18px;...font-weight:700!..."> Letícia -> hospede
+        6) <p style="font-size:18px;...font-weight:400!..."> "2 adultos" ou "2 adultos, 1 criança" -> quantidade_hospedes (soma)
+        7) <h3 style="font-size:18px;...text-align:right!...">R$1.717,53</h3> -> valor_total
         """
         reserva = {
             "origem": "airbnb",
@@ -192,87 +274,109 @@ class AirbnbGmailSyncBot:
             "valor_total": 0.0,
             "moeda": "BRL",
             "codigo_reserva": "",
+            "nomeApAirbnb": ""
         }
         
         try:
-            # Exemplos de regex que você pode ir refinando conforme seus e-mails reais:
+            html = email_body
+
+            # -------- 1) Nome do apartamento (h2) --------
+            match_nome = re.search(
+                r'<h2[^>]*>(.*?)</h2>',
+                html,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            if match_nome:
+                nome_raw = match_nome.group(1)
+                reserva["nomeApAirbnb"] = self._limpar_html(nome_raw)
             
-            # Nome do hóspede (exemplo de padrão)
-            match_hospede = re.search(r"Hóspede:\s*(.*)", email_body)
+            # -------- 2) & 3) Datas de check-in e check-out --------
+            # <p style="font-size:22px;line-height:26px;...">qua., 18 de fev. de 2026</p>
+            padrao_datas = (
+                r'<p[^>]*font-size:22px;line-height:26px;'
+                r'color:#222222;font-family:Cereal[^>]*>(.*?)</p>'
+            )
+            datas = re.findall(padrao_datas, html, flags=re.IGNORECASE | re.DOTALL)
+            if datas:
+                # Primeiro p = check-in
+                checkin_str = self._limpar_html(datas[0])
+                reserva["checkin"] = self._parse_data_pt_br(checkin_str)
+
+                # Segundo p (se existir) = check-out
+                if len(datas) > 1:
+                    checkout_str = self._limpar_html(datas[1])
+                    reserva["checkout"] = self._parse_data_pt_br(checkout_str)
+
+            # -------- 4) Código da reserva --------
+            # <p style="font-size:18px;line-height:28px;...font-weight:400;margin:0!important">HMB39THXQK</p>
+            match_codigo_tag = re.search(
+                r'<p[^>]*font-size:18px;line-height:28px;font-family:Cereal[^>]*'
+                r'font-weight:400[^>]*margin:0!important[^>]*>(.*?)</p>',
+                html,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            if match_codigo_tag:
+                texto_codigo = self._limpar_html(match_codigo_tag.group(1))
+                # Procura algo tipo HMB39THXQK
+                m_cod = re.search(r'\b[A-Z0-9]{6,14}\b', texto_codigo)
+                if m_cod:
+                    reserva["codigo_reserva"] = m_cod.group(0).strip()
+
+            # Fallback extra para código se ainda estiver vazio
+            if not reserva["codigo_reserva"]:
+                texto_limpo = self._limpar_html(html)
+                possiveis_codigos = re.findall(r'\b[A-Z0-9]{8,14}\b', texto_limpo)
+                if possiveis_codigos:
+                    reserva["codigo_reserva"] = possiveis_codigos[0]
+
+            # -------- 5) Nome do hóspede --------
+            # <p ...font-weight:700!important">Letícia</p>
+            match_hospede = re.search(
+                r'<p[^>]*font-weight:700!important[^>]*>(.*?)</p>',
+                html,
+                flags=re.IGNORECASE | re.DOTALL
+            )
             if match_hospede:
-                reserva["hospede"] = match_hospede.group(1).strip()
-            
-            # Check-in
-            match_checkin = re.search(r"Check[- ]in:\s*([\d]{1,2}\s+\w+\s+[\d]{4})", email_body)
-            if match_checkin:
-                reserva["checkin"] = self._parse_data_pt_br(match_checkin.group(1))
-            
-            # Check-out
-            match_checkout = re.search(r"Check[- ]out:\s*([\d]{1,2}\s+\w+\s+[\d]{4})", email_body)
-            if match_checkout:
-                reserva["checkout"] = self._parse_data_pt_br(match_checkout.group(1))
-            
-            # Quantidade de hóspedes
-            match_hospedes = re.search(r"(\d+)\s+hóspede", email_body, re.IGNORECASE)
-            if match_hospedes:
-                reserva["quantidade_hospedes"] = int(match_hospedes.group(1))
-            
-            # Valor total (exemplo: R$ 1.234,56)
-            match_valor = re.search(r"R\$\s*([\d\.\,]+)", email_body)
-            if match_valor:
-                valor_str = match_valor.group(1).replace('.', '').replace(',', '.')
-                reserva["valor_total"] = float(valor_str)
-            
-            # Código de reserva (por exemplo, código alfanumérico do Airbnb)
-            match_codigo = re.search(r"Código da reserva:\s*([A-Z0-9]+)", email_body)
-            if match_codigo:
-                reserva["codigo_reserva"] = match_codigo.group(1).strip()
-            
+                reserva["hospede"] = self._limpar_html(match_hospede.group(1))
+
+            # -------- 6) Quantidade de hóspedes (adultos + crianças + bebês) --------
+            # <p ...font-weight:400!important">2 adultos</p>
+            blocos_hosp = re.findall(
+                r'<p[^>]*font-weight:400!important[^>]*>(.*?)</p>',
+                html,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            for bloco in blocos_hosp:
+                texto = self._limpar_html(bloco).lower()
+                if any(p in texto for p in ["adult", "crian", "beb"]):
+                    numeros = [int(n) for n in re.findall(r'(\d+)', texto)]
+                    if numeros:
+                        reserva["quantidade_hospedes"] = sum(numeros)
+                        break
+
+            # -------- 7) Valor total --------
+            # <h3 ...text-align:right!important">R$1.717,53</h3>
+            match_valor_tag = re.search(
+                r'<h3[^>]*text-align:right!important[^>]*>(.*?)</h3>',
+                html,
+                flags=re.IGNORECASE | re.DOTALL
+            )
+            if match_valor_tag:
+                valor_txt = self._limpar_html(match_valor_tag.group(1))
+                # Ex: "R$1.717,53" ou "R$ 1.717,53"
+                valor_sem_simbolo = valor_txt.replace('R$', '').strip()
+                valor_sem_simbolo = valor_sem_simbolo.replace('.', '').replace(',', '.')
+                try:
+                    reserva["valor_total"] = float(valor_sem_simbolo)
+                except Exception as e:
+                    logger.error(f"Erro ao converter valor_total '{valor_txt}': {e}")
+
             logger.info(f"📦 Reserva Airbnb parseada: {reserva}")
-        
+
         except Exception as e:
             logger.error(f"Erro ao parsear e-mail de reserva Airbnb: {e}")
         
         return reserva
-
-    def _parse_data_pt_br(self, data_str: str) -> str:
-        """
-        Converte uma data em português (tipo '10 de dezembro de 2025')
-        ou ('10 dezembro 2025') para formato ISO (YYYY-MM-DD).
-        """
-        # Este mapeamento pode ser expandido conforme necessário
-        meses = {
-            "janeiro": 1,
-            "fevereiro": 2,
-            "março": 3,
-            "marco": 3,
-            "abril": 4,
-            "maio": 5,
-            "junho": 6,
-            "julho": 7,
-            "agosto": 8,
-            "setembro": 9,
-            "outubro": 10,
-            "novembro": 11,
-            "dezembro": 12
-        }
-        
-        try:
-            # Tenta padronizar removendo "de"
-            data_str_limpa = data_str.lower().replace(" de ", " ").strip()
-            partes = data_str_limpa.split()
-            if len(partes) == 3:
-                dia = int(partes[0])
-                mes_nome = partes[1]
-                ano = int(partes[2])
-                mes = meses.get(mes_nome, 1)
-                dt = datetime(ano, mes, dia)
-                return dt.strftime("%Y-%m-%d")
-        except Exception as e:
-            logger.error(f"Erro ao converter data '{data_str}': {e}")
-        
-        # Em caso de falha, retorna a string original
-        return data_str
 
     # ---------------------------------------------------------
     # Integração com Gmail
@@ -333,10 +437,10 @@ class AirbnbGmailSyncBot:
     def salvar_reserva_no_firestore(self, reserva: Dict):
         """
         Salva ou atualiza uma reserva no Firestore.
-        A coleção e chave podem ser adaptadas de acordo com a sua estrutura.
+        Coleção: reservas_airbnb
+        Documento: codigo_reserva ou id_email (fallback).
         """
         try:
-            # Exemplo: coleção 'reservas_airbnb', documento pelo 'codigo_reserva' ou 'id_email'
             colecao = "reservas_airbnb"
             doc_id = reserva.get("codigo_reserva") or reserva.get("id_email")
             
